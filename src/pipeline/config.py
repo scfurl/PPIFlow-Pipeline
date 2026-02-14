@@ -88,6 +88,28 @@ def _apply_binder_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _parse_length_bounds(value: Any, *, field: str) -> tuple[int, int]:
+    text = str(value).strip()
+    if not text:
+        raise ConfigError(f"{field} is required")
+    try:
+        if "-" in text:
+            parts = [p.strip() for p in text.split("-", 1)]
+            if len(parts) != 2:
+                raise ValueError("invalid range format")
+            lo = int(parts[0])
+            hi = int(parts[1])
+        else:
+            lo = hi = int(text)
+    except Exception as exc:
+        raise ConfigError(f"{field} must be an integer or integer range (e.g. 75-90)") from exc
+    if lo <= 0 or hi <= 0:
+        raise ConfigError(f"{field} values must be > 0")
+    if hi < lo:
+        raise ConfigError(f"{field} range must be ascending (got {lo}-{hi})")
+    return lo, hi
+
+
 def validate_input(data: Dict[str, Any]) -> None:
     protocol = data.get("protocol")
     if protocol not in {"binder", "antibody", "vhh"}:
@@ -103,6 +125,7 @@ def validate_input(data: Dict[str, Any]) -> None:
         binder = data.get("binder") or {}
         if not binder.get("length"):
             raise ConfigError("binder.length is required for binder protocol")
+        _parse_length_bounds(binder.get("length"), field="binder.length")
         if data.get("framework"):
             raise ConfigError("framework block must be absent for binder protocol")
     else:
@@ -312,9 +335,14 @@ def normalize_input(
         elif protocol == "vhh":
             ckpt_name = "nanobody.ckpt"
         if ckpt_name:
-            candidate = _ROOT / "assets" / "checkpoints" / ckpt_name
-            if candidate.exists():
-                tools["ppiflow_ckpt"] = str(candidate)
+            candidates = [
+                _ROOT / "assets" / "checkpoints" / ckpt_name,
+                _ROOT / "external_data" / "ppiflow_checkpoints" / ckpt_name,
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    tools["ppiflow_ckpt"] = str(candidate)
+                    break
 
     # Protocol-aware defaults (paper-aligned)
     seq = out.get("sequence_design") or {}

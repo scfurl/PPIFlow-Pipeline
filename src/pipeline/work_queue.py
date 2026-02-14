@@ -64,6 +64,17 @@ def _warn(message: str) -> None:
     print(f"[work_queue] WARN {message}", file=sys.__stdout__, flush=True)
 
 
+def _is_missing_table_error(exc: Exception, table: str | None = None) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).strip().lower()
+    if "no such table" not in msg:
+        return False
+    if not table:
+        return True
+    return msg.endswith(f"no such table: {table.lower()}")
+
+
 class WorkQueue:
     def __init__(
         self,
@@ -81,7 +92,12 @@ class WorkQueue:
 
         self.lease_seconds = int(self.cfg.get("lease_seconds") or 300)
         self.max_attempts = int(self.cfg.get("max_attempts") or 2)
-        self.retry_failed = bool(self.cfg.get("retry_failed"))
+        retry_failed_cfg = self.cfg.get("retry_failed")
+        retry_failed_env = os.environ.get("PPIFLOW_WORK_QUEUE_RETRY_FAILED")
+        if retry_failed_env is not None:
+            self.retry_failed = str(retry_failed_env).strip().lower() in {"1", "true", "yes", "y", "on"}
+        else:
+            self.retry_failed = bool(retry_failed_cfg)
         batch_val = self.cfg.get("batch_size")
         self.batch_size = 1 if batch_val is None else int(batch_val)
         self.leader_timeout = int(self.cfg.get("leader_timeout") or 600)
@@ -762,7 +778,14 @@ class WorkQueue:
             return counts
         conn = self._connect()
         try:
-            rows = conn.execute("SELECT status, COUNT(*) AS c FROM items GROUP BY status").fetchall()
+            try:
+                rows = conn.execute("SELECT status, COUNT(*) AS c FROM items GROUP BY status").fetchall()
+            except sqlite3.OperationalError as exc:
+                # Transient during queue initialization/rebuild: queue.db exists but schema
+                # has not been created yet. Callers should keep polling.
+                if _is_missing_table_error(exc, "items"):
+                    return counts
+                raise
             for row in rows:
                 status = str(row["status"] or "pending")
                 if status not in counts:
@@ -822,7 +845,14 @@ class WorkQueue:
             return None
         conn = self._connect()
         try:
-            row = conn.execute("SELECT * FROM leader WHERE id=1").fetchone()
+            try:
+                row = conn.execute("SELECT * FROM leader WHERE id=1").fetchone()
+            except sqlite3.OperationalError as exc:
+                # Transient during queue initialization/rebuild: queue.db exists but schema
+                # has not been created yet. Callers should keep polling.
+                if _is_missing_table_error(exc, "leader"):
+                    return None
+                raise
             if not row:
                 return None
             return {

@@ -4,7 +4,10 @@ import os
 import logging
 import torch.distributed as dist
 import copy
-from lightning import LightningModule
+try:
+    from lightning import LightningModule
+except ModuleNotFoundError:
+    from pytorch_lightning import LightningModule
 
 
 from analysis import pdb_clash

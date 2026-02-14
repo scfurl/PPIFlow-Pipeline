@@ -8,7 +8,10 @@ import numpy as np
 import pandas as pd
 from analysis import utils as au
 # from pytorch_lightning.utilities.rank_zero import rank_zero_only
-from lightning.pytorch.utilities.rank_zero import rank_zero_only
+try:
+    from lightning.pytorch.utilities.rank_zero import rank_zero_only
+except ModuleNotFoundError:
+    from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from motif_scaffolding import save_motif_segments
 from core.utils import rigid_utils as ru
 
@@ -218,7 +221,23 @@ def test_dataset_creation(dataset_class, cfg, task):
     return test_dataset
 
 def get_available_device(num_device):
-    return GPUtil.getAvailable(order='memory', limit = 8)[:num_device]
+    try:
+        requested = int(num_device)
+    except Exception:
+        requested = 0
+    if requested <= 0:
+        return []
+    try:
+        limit = max(8, requested)
+        return GPUtil.getAvailable(order="memory", limit=limit)[:requested]
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            return list(range(min(requested, int(torch.cuda.device_count() or 0))))
+    except Exception:
+        pass
+    return []
 
 
 def save_traj(

@@ -20,6 +20,7 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 sys.path.append(os.path.dirname(__file__))
@@ -129,6 +130,10 @@ class FusedLayerNorm(torch.nn.Module):
         return self.kernel_forward(input)
 
     def kernel_forward(self, input):
+        if not input.is_cuda:
+            weight = self.weight.to(device=input.device, dtype=input.dtype)
+            bias = self.bias.to(device=input.device, dtype=input.dtype)
+            return F.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
         return FusedLayerNormAffineFunction.apply(
             input, self.weight, self.bias, self.normalized_shape, self.eps
         )

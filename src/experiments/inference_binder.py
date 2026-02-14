@@ -3,8 +3,11 @@ import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from lightning import LightningModule
-from lightning.pytorch import Trainer
+try:
+    from lightning import LightningModule
+    from lightning.pytorch import Trainer
+except ModuleNotFoundError:
+    from pytorch_lightning import LightningModule, Trainer
 
 
 from data.datasets import PpiTestDataset, PpiScaffoldingTestDataset
@@ -72,24 +75,24 @@ class Experiment:
             self._test_dataset, shuffle=False, batch_size=self.batch_size
         )
 
+        trainer_cfg = dict(self._exp_cfg.trainer) if "trainer" in self._exp_cfg else {}
+        trainer_cfg.update(
+            {
+                "logger": False,
+                "use_distributed_sampler": False,
+                "enable_model_summary": True,
+            }
+        )
         if torch.cuda.is_available():
+            trainer_cfg["devices"] = self._train_device_ids
             trainer = Trainer(
-                logger=False,
-                use_distributed_sampler=False,
-                enable_model_summary=True,
-                devices=self._train_device_ids,
+                **trainer_cfg,
             )
         else:
-            self._exp_cfg.trainer.update({"accelerator": "cpu"})
-            self._exp_cfg.trainer = {
-                k: v
-                for k, v in self._exp_cfg.trainer.items()
-                if k != "strategy"
-            }
+            trainer_cfg["accelerator"] = "cpu"
+            trainer_cfg.pop("strategy", None)
             trainer = Trainer(
-                logger=False,
-                use_distributed_sampler=False,
-                enable_model_summary=True,
+                **trainer_cfg,
             )
 
         trainer.test(

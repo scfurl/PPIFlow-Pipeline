@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -135,6 +136,7 @@ def _wait_for_ready_outputs(
     step_cfg: dict[str, Any],
     ctx: StepContext,
     timeout: Optional[float],
+    procs: Optional[list[subprocess.Popen]] = None,
     poll_seconds: float = 2.0,
 ) -> bool:
     step_cls = STEP_REGISTRY.get(step_name)
@@ -149,6 +151,8 @@ def _wait_for_ready_outputs(
                 return True
         except Exception:
             pass
+        if procs is not None and all(proc.poll() is not None for proc in procs):
+            return False
         if timeout is not None and (time.time() - start) >= float(timeout):
             return False
         if not warned:
@@ -178,7 +182,9 @@ def _outputs_complete(
 
 
 def _normalize_failure_policy(raw: Dict[str, Any], override_mode: Optional[str]) -> FailurePolicy:
-    mode = str(raw.get("mode") or "allow").lower()
+    # Default should match CLI semantics: fail on item errors unless the user explicitly opts in
+    # to tolerant execution (--continue-on-error / failure-policy allow/threshold).
+    mode = str(raw.get("mode") or "strict").lower()
     if override_mode:
         mode = str(override_mode).lower()
     if mode not in {"allow", "strict", "threshold"}:
@@ -509,6 +515,48 @@ def _clear_failure_markers(step_dir: Path) -> None:
         pass
 
 
+def _summarize_item_failures(step_dir: Path) -> Optional[str]:
+    db_path = step_dir / "queue.db"
+    if not db_path.exists():
+        return None
+    try:
+        wq = WorkQueue.from_step_dir(step_dir)
+        counts = wq.counts()
+        failed = int(counts.get("failed", 0) or 0)
+        blocked = int(counts.get("blocked", 0) or 0)
+        if failed <= 0 and blocked <= 0:
+            return None
+
+        sample_error: str | None = None
+        con = sqlite3.connect(str(db_path))
+        try:
+            cur = con.cursor()
+            row = cur.execute(
+                """
+                SELECT last_error, COUNT(*) AS n
+                FROM items
+                WHERE status IN ('failed', 'blocked')
+                  AND COALESCE(last_error, '') <> ''
+                GROUP BY last_error
+                ORDER BY n DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row and row[0]:
+                sample_error = str(row[0]).strip().replace("\n", " ")
+        finally:
+            con.close()
+
+        detail = f"{failed} failed, {blocked} blocked"
+        if sample_error:
+            if len(sample_error) > 240:
+                sample_error = sample_error[:237] + "..."
+            detail += f"; sample error: {sample_error}"
+        return detail
+    except Exception:
+        return None
+
+
 def _reset_attempt_logs(run_dir: Path) -> None:
     # Intentionally do not truncate logs; append across attempts.
     return
@@ -753,7 +801,15 @@ def orchestrate_pipeline(args) -> None:
             getattr(args, "failure_policy", None),
         )
 
-        continue_on_error = failure_policy.mode in {"allow", "threshold"}
+        explicit_continue_on_error = bool(getattr(args, "continue_on_error", False))
+        # CLI --continue-on-error should override a strict default/config for this run.
+        if explicit_continue_on_error and failure_policy.mode == "strict":
+            failure_policy = FailurePolicy(
+                mode="allow",
+                max_failed=failure_policy.max_failed,
+                max_failed_ratio=failure_policy.max_failed_ratio,
+            )
+        continue_on_error = explicit_continue_on_error or failure_policy.mode in {"allow", "threshold"}
         if continue_on_error:
             # Keep ready_ctx consistent with worker behavior when we spawn with --continue-on-error.
             options = input_data.setdefault("options", {})
@@ -1033,7 +1089,7 @@ def orchestrate_pipeline(args) -> None:
             step_success = False
             while attempt < max_attempts and not step_success:
                 attempt += 1
-                if attempt > 1:
+                if explicit_retry or attempt > 1:
                     for step_name in entry.steps:
                         _clear_failure_markers(out_dir / ".work" / step_name)
                 run_dir = orch_dir / "runs" / entry.name
@@ -1117,14 +1173,28 @@ def orchestrate_pipeline(args) -> None:
                     if result.status == "completed":
                         if not _policy_allows(failure_policy, result.counts):
                             step_ok = False
-                            failed_reason = "failure_policy"
+                            detail = _summarize_item_failures(out_dir / ".work" / step_name)
+                            failed_reason = f"failure_policy ({detail})" if detail else "failure_policy"
                             break
                         step_cfg = step_cfgs.get(step_name) or {"name": step_name}
+                        # Avoid indefinite waits when workers exited cleanly (e.g., with
+                        # --continue-on-error) but required outputs were never produced.
+                        if all(proc.poll() is not None for proc in procs) and not _outputs_complete(
+                            step_name=step_name,
+                            step_cfg=step_cfg,
+                            ctx=ready_ctx,
+                        ):
+                            step_ok = False
+                            failed_reason = "outputs_not_ready_after_workers_exit"
+                            step_info["status"] = "failed"
+                            step_info["reason"] = failed_reason
+                            break
                         if not _wait_for_ready_outputs(
                             step_name=step_name,
                             step_cfg=step_cfg,
                             ctx=ready_ctx,
                             timeout=step_wait_timeout,
+                            procs=procs,
                         ):
                             step_ok = False
                             failed_reason = "outputs_not_ready"

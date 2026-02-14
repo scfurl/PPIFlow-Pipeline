@@ -257,11 +257,64 @@ class SeqDesignStep(ExternalCommandStep):
             return f"{heavy},{light}"
         return heavy
 
+    def _mpnn_tool_keys(self, ctx: StepContext) -> tuple[str, str]:
+        if ctx.input_data.get("protocol") == "binder":
+            return "mpnn_run", "mpnn_repo"
+        return "abmpnn_run", "abmpnn_repo"
+
     def _default_mpnn_run(self, ctx: StepContext) -> Path | None:
         tools = ctx.input_data.get("tools") or {}
-        if ctx.input_data.get("protocol") == "binder":
-            return Path(tools.get("mpnn_run") or tools.get("mpnn_repo", "")).joinpath("protein_mpnn_run.py")
-        return Path(tools.get("abmpnn_run") or tools.get("abmpnn_repo", "")).joinpath("protein_mpnn_run.py")
+        run_key, repo_key = self._mpnn_tool_keys(ctx)
+        raw = tools.get(run_key) or tools.get(repo_key)
+        if not raw:
+            return None
+        path = Path(str(raw))
+        if path.is_dir():
+            return path / "protein_mpnn_run.py"
+        # Accept --mpnn_run as either an explicit script path or a directory-like value.
+        if path.name == "protein_mpnn_run.py":
+            return path
+        return path / "protein_mpnn_run.py"
+
+    def _require_mpnn_run(self, ctx: StepContext) -> Path:
+        run_key, repo_key = self._mpnn_tool_keys(ctx)
+        mpnn_run = self._default_mpnn_run(ctx)
+        if mpnn_run and mpnn_run.exists():
+            return mpnn_run
+        resolved = str(mpnn_run) if mpnn_run else "<unset>"
+        cfg_path = self.cfg.get("config_path")
+        msg = (
+            f"MPNN runner not found at {resolved}. "
+            f"Set tools.{run_key} to protein_mpnn_run.py or tools.{repo_key} to a ProteinMPNN repo."
+        )
+        if cfg_path:
+            msg += f" (config: {cfg_path})"
+        raise StepError(msg)
+
+    def _resolve_seq_ckpt(self, ctx: StepContext, seq_cfg: dict[str, Any]) -> str | None:
+        tools = ctx.input_data.get("tools") or {}
+        protocol = ctx.input_data.get("protocol")
+        ckpt = tools.get("mpnn_ckpt") if protocol == "binder" else tools.get("abmpnn_ckpt")
+        use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
+        if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
+            ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
+        return str(ckpt) if ckpt else None
+
+    def _require_seq_ckpt(self, ctx: StepContext, seq_cfg: dict[str, Any]) -> str:
+        protocol = ctx.input_data.get("protocol")
+        ckpt = self._resolve_seq_ckpt(ctx, seq_cfg)
+        if not ckpt:
+            if protocol == "binder":
+                raise StepError(
+                    "Missing ProteinMPNN weights. Set tools.mpnn_ckpt (and optionally tools.mpnn_ckpt_soluble for seq2)."
+                )
+            raise StepError("Missing AbMPNN weights. Set tools.abmpnn_ckpt.")
+        ckpt_path = Path(ckpt)
+        if not ckpt_path.exists():
+            if protocol == "binder":
+                raise StepError(f"ProteinMPNN weights path not found: {ckpt_path} (tools.mpnn_ckpt)")
+            raise StepError(f"AbMPNN weights path not found: {ckpt_path} (tools.abmpnn_ckpt)")
+        return ckpt
 
     def _resolve_weights(self, ckpt: str | None) -> tuple[Path | None, str | None]:
         if not ckpt:
@@ -846,6 +899,14 @@ class SeqDesignStep(ExternalCommandStep):
         return None
 
     def build_items(self, ctx: StepContext) -> list[WorkItem]:
+        # Fail fast for tool wiring problems (otherwise we only discover this after workers run and
+        # downstream steps may fail with secondary errors).
+        self._require_mpnn_run(ctx)
+        seq_cfg = (ctx.input_data.get("sequence_design") or {}).get(
+            "round1" if self.cfg.get("name") == "seq1" else "round2"
+        ) or {}
+        self._require_seq_ckpt(ctx, seq_cfg)
+
         input_dir = self.cfg.get("input_dir")
         if not input_dir:
             raise StepError(f"Step {self.name} missing input_dir")
@@ -891,7 +952,6 @@ class SeqDesignStep(ExternalCommandStep):
         return self._find_fasta(out_dir, stem) is not None
 
     def run_item(self, ctx: StepContext, item: WorkItem) -> None:
-        tools = ctx.input_data.get("tools") or {}
         out_dir = self.output_dir(ctx)
         step_name = str(self.cfg.get("name") or self.name)
         if is_minimal(ctx):
@@ -900,16 +960,11 @@ class SeqDesignStep(ExternalCommandStep):
             item_tmp = out_dir / ".tmp" / item.id
         item_tmp.mkdir(parents=True, exist_ok=True)
 
-        mpnn_run = self._default_mpnn_run(ctx)
-        if not mpnn_run or not mpnn_run.exists():
-            raise StepError(
-                f"MPNN runner not found. Set tools.mpnn_run/abmpnn_run or provide command in {self.cfg.get('config_path')}"
-            )
-        ckpt = tools.get("mpnn_ckpt") if ctx.input_data.get("protocol") == "binder" else tools.get("abmpnn_ckpt")
-
+        mpnn_run = self._require_mpnn_run(ctx)
         seq_cfg = (ctx.input_data.get("sequence_design") or {}).get(
             "round1" if self.cfg.get("name") == "seq1" else "round2"
         ) or {}
+        ckpt = self._require_seq_ckpt(ctx, seq_cfg)
         num_seq = int(seq_cfg.get("num_seq_per_backbone") or 0)
         sampling_temp = float(seq_cfg.get("sampling_temp") or 0.1)
         if num_seq <= 0:
@@ -919,8 +974,6 @@ class SeqDesignStep(ExternalCommandStep):
         protocol = ctx.input_data.get("protocol")
         omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
-        if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
-            ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
 
         weight_dir, model_name = self._resolve_weights(ckpt)
         chain_arg = " ".join(str(chain_list).replace(",", " ").split())
@@ -1071,7 +1124,6 @@ class SeqDesignStep(ExternalCommandStep):
         shutil.rmtree(item_tmp, ignore_errors=True)
 
     def run_batch(self, ctx: StepContext, items: list[WorkItem]) -> dict[str, tuple[str, str | None]]:
-        tools = ctx.input_data.get("tools") or {}
         out_dir = self.output_dir(ctx)
         batch_id = items[0].id if items else "batch"
         step_name = str(self.cfg.get("name") or self.name)
@@ -1083,16 +1135,11 @@ class SeqDesignStep(ExternalCommandStep):
         pdb_dir = batch_dir / "pdbs"
         pdb_dir.mkdir(parents=True, exist_ok=True)
 
-        mpnn_run = self._default_mpnn_run(ctx)
-        if not mpnn_run or not mpnn_run.exists():
-            raise StepError(
-                f"MPNN runner not found. Set tools.mpnn_run/abmpnn_run or provide command in {self.cfg.get('config_path')}"
-            )
-        ckpt = tools.get("mpnn_ckpt") if ctx.input_data.get("protocol") == "binder" else tools.get("abmpnn_ckpt")
-
+        mpnn_run = self._require_mpnn_run(ctx)
         seq_cfg = (ctx.input_data.get("sequence_design") or {}).get(
             "round1" if self.cfg.get("name") == "seq1" else "round2"
         ) or {}
+        ckpt = self._require_seq_ckpt(ctx, seq_cfg)
         num_seq = int(seq_cfg.get("num_seq_per_backbone") or 0)
         sampling_temp = float(seq_cfg.get("sampling_temp") or 0.1)
         if num_seq <= 0:
@@ -1103,8 +1150,6 @@ class SeqDesignStep(ExternalCommandStep):
         protocol = ctx.input_data.get("protocol")
         omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
-        if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
-            ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
 
         weight_dir, model_name = self._resolve_weights(ckpt)
         seed = str(int((ctx.state.get("runs") or [{}])[0].get("run_seed", 0) or 0))
@@ -1332,7 +1377,6 @@ class SeqDesignStep(ExternalCommandStep):
         if self.cfg.get("command"):
             return super().run_full(ctx)
 
-        tools = ctx.input_data.get("tools") or {}
         input_dir = self.cfg.get("input_dir")
         if not input_dir:
             raise StepError(f"Step {self.name} missing input_dir")
@@ -1341,14 +1385,9 @@ class SeqDesignStep(ExternalCommandStep):
             raise StepError(f"Input dir not found: {input_dir}")
         out_dir = self.output_dir(ctx)
 
-        mpnn_run = self._default_mpnn_run(ctx)
-        if not mpnn_run or not mpnn_run.exists():
-            raise StepError(
-                f"MPNN runner not found. Set tools.mpnn_run/abmpnn_run or provide command in {self.cfg.get('config_path')}"
-            )
-        ckpt = tools.get("mpnn_ckpt") if ctx.input_data.get("protocol") == "binder" else tools.get("abmpnn_ckpt")
-
+        mpnn_run = self._require_mpnn_run(ctx)
         seq_cfg = (ctx.input_data.get("sequence_design") or {}).get("round1" if self.cfg.get("name") == "seq1" else "round2") or {}
+        ckpt = self._require_seq_ckpt(ctx, seq_cfg)
         num_seq = int(seq_cfg.get("num_seq_per_backbone") or 0)
         sampling_temp = float(seq_cfg.get("sampling_temp") or 0.1)
         if num_seq <= 0:
@@ -1359,8 +1398,6 @@ class SeqDesignStep(ExternalCommandStep):
         protocol = ctx.input_data.get("protocol")
         omit_aas = seq_cfg.get("omit_aas") if protocol != "binder" else None
         use_soluble = bool(seq_cfg.get("use_soluble_ckpt"))
-        if protocol == "binder" and use_soluble and self.cfg.get("name") == "seq2":
-            ckpt = tools.get("mpnn_ckpt_soluble") or ckpt
 
         weight_dir, model_name = self._resolve_weights(ckpt)
         chain_arg = " ".join(str(chain_list).replace(",", " ").split())

@@ -286,9 +286,12 @@ class RunLock:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
-        # Only remove the lock if we still appear to be the active owner.
+        # Only remove the lock when we can positively prove ownership.
+        # If owner.json is temporarily unreadable (active=None), be conservative and keep it.
         active = read_active_lock_id(self.out_dir)
-        if active and str(active) != str(self.lock_id):
+        if active is None:
+            return
+        if str(active) != str(self.lock_id):
             return
 
         try:

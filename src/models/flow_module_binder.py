@@ -6,7 +6,10 @@ import pandas as pd
 import logging
 import socket
 import torch.distributed as dist
-from lightning import LightningModule
+try:
+    from lightning import LightningModule
+except ModuleNotFoundError:
+    from pytorch_lightning import LightningModule
 
 from analysis import metrics
 from analysis import utils as au

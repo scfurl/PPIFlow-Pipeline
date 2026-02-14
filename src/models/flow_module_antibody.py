@@ -9,7 +9,10 @@ import tempfile
 import torch.distributed as dist
 import pandas as pd
 
-from lightning import LightningModule
+try:
+    from lightning import LightningModule
+except ModuleNotFoundError:
+    from pytorch_lightning import LightningModule
 from omegaconf import OmegaConf
 
 from analysis.antibody_metric import (

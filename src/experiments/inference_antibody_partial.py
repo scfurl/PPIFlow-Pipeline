@@ -6,8 +6,11 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
-from lightning import LightningModule
-from lightning.pytorch import Trainer
+try:
+    from lightning import LightningModule
+    from lightning.pytorch import Trainer
+except ModuleNotFoundError:
+    from pytorch_lightning import LightningModule, Trainer
 from torch.utils.data import DataLoader
 from models.flow_module_antibody_partial import FlowModule
 from experiments import utils as eu

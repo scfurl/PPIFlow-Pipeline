@@ -20,6 +20,12 @@ FLOWPACKER_REPO = os.environ.get("FLOWPACKER_REPO")
 if FLOWPACKER_REPO:
     sys.path.insert(0, FLOWPACKER_REPO)
 
+# FlowPacker/OpenFold imports `tree` (dm-tree). In this repo we ship a small
+# compatible fallback at src/tree.py for environments where dm-tree is absent.
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
 from utils.loader import load_seed, load_device, load_ema, load_checkpoint, load_config
 from utils.logger import Logger, set_log
 from utils.train_utils import count_parameters
@@ -32,6 +38,15 @@ from models.equiformer_v2.equiformer_v2 import EquiformerV2
 from utils.metrics import metrics_per_chi, atom_rmsd
 from utils.constants import chi_mask as chi_mask_true
 from utils.constants import atom14_mask as atom_mask_true
+
+
+def _torch_load_ckpt(path: str, *, map_location=None):
+    """Compatibility loader across torch versions (PyTorch 2.6 defaults weights_only=True)."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older torch versions do not support the weights_only kwarg.
+        return torch.load(path, map_location=map_location)
 
 
 def _split_multichain_sequence(seq: str) -> list[str]:
@@ -294,6 +309,10 @@ class Sampler(object):
         self.use_gt_masks = use_gt_masks
         self.seed = load_seed(self.config.seed)
         self.device = load_device()
+        if isinstance(self.device, list) and self.device:
+            self.torch_device = torch.device(f"cuda:{self.device[0]}")
+        else:
+            self.torch_device = torch.device("cpu")
         self.train_loader, self.test_loader, _, _ = get_dataloader(self.config, ddp=ddp, sample=True)
         self.idealizer = Idealizer(use_native_bb_coords=True)
 
@@ -301,7 +320,7 @@ class Sampler(object):
         self.config.exp_name = ts
         self.ckpt = f"{ts}"
 
-        ckpt_dict = torch.load(self.config.ckpt)
+        ckpt_dict = _torch_load_ckpt(self.config.ckpt, map_location=self.torch_device)
         train_cfg = ckpt_dict["config"]
         self.log_folder_name, self.log_dir, self.ckpt_dir = set_log(train_cfg)
         self.model = CNF(
@@ -310,7 +329,7 @@ class Sampler(object):
             coeff=self.config.sample.coeff,
             stepsize=self.config.sample.num_steps,
             mode=self.config.mode,
-        ).cuda()
+        ).to(self.torch_device)
         print(f"Number of parameters: {count_parameters(self.model)}")
         self.ema = load_ema(self.model, decay=train_cfg.train.ema)
         self.model, self.ema = load_checkpoint(self.model, self.ema, ckpt_dict)
@@ -318,8 +337,11 @@ class Sampler(object):
         self.ema.copy_to(self.model.parameters())
 
         if self.config.conf_ckpt is not None:
-            conf_ckpt = torch.load(self.config.conf_ckpt)
-            self.conf_model = Confidence(EquiformerV2(**conf_ckpt["config"].model), conf_ckpt["config"]).cuda()
+            conf_ckpt = _torch_load_ckpt(self.config.conf_ckpt, map_location=self.torch_device)
+            self.conf_model = Confidence(EquiformerV2(**conf_ckpt["config"].model), conf_ckpt["config"]).to(
+                self.torch_device
+            )
+            state_dict = conf_ckpt["state_dict"]
             if "module." in list(conf_ckpt["state_dict"].keys())[0]:
                 state_dict = {k[7:]: v for k, v in conf_ckpt["state_dict"].items()}
             self.conf_model.load_state_dict(state_dict)
@@ -335,7 +357,7 @@ class Sampler(object):
         output_dict = {}
         with torch.no_grad():
             for batch in tqdm(self.test_loader):
-                batch = batch.to(f"cuda:{self.device[0]}")
+                batch = batch.to(self.torch_device)
                 aa_str, aa_onehot, aa_num, coords, mask, atom_mask, batch_id, pdb_codes = (
                     batch.aa_str,
                     batch.aa_onehot,
