@@ -2,6 +2,7 @@ import os
 from glob import glob
 from functools import partial
 from multiprocessing import Pool, cpu_count
+from pathlib import Path
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -10,6 +11,10 @@ import ast
 import argparse
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def _pdb_stem(path_str):
+    return Path(str(path_str)).stem
 
 
 def get_rosetta_result(logfile):
@@ -166,9 +171,10 @@ def get_input_df(args):
         pdbfiles = glob(f"{input_pdbdir}/*.pdb")
         print(f"Found pdb: {len(pdbfiles)}")
         df = pd.DataFrame({'pdbpath': pdbfiles})
-    df["pdbname"] = df["pdbpath"].apply(lambda x: os.path.splitext(os.path.basename(x))[0])
-    df['rosetta_path'] = df['pdbpath'].apply(lambda
-                                              x: f"{rosetta_dir}/{os.path.basename(x).split('.pdb')[0]}/out/{os.path.basename(x).split('.pdb')[0]}.out")
+    df["pdbname"] = df["pdbpath"].apply(_pdb_stem)
+    df["rosetta_path"] = df["pdbname"].apply(
+        lambda name: f"{rosetta_dir}/{name}/out/{name}.out"
+    )
 
     df["target_id"] = args.target_id
     df['binder_id'] = args.binder_id
@@ -189,7 +195,7 @@ def main(row, output_dir="", distance_threshold=10, plot=True):
         interface_pair = get_residue_pairs_within_distance(pdb_file, binder_id, target_id, distance_threshold=distance_threshold)
         plot_path = None
         if plot:
-            plot_path = os.path.join(output_dir, os.path.basename(pdb_file).split('.pdb')[0] + ".png")
+            plot_path = os.path.join(output_dir, _pdb_stem(pdb_file) + ".png")
             print(plot_path)
         summed_dict = get_interface_energy(
             interchain_score_path,
