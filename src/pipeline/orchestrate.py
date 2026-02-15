@@ -1254,6 +1254,11 @@ def orchestrate_pipeline(args) -> None:
 
         if summary.get("status") != "failed":
             summary["status"] = "completed"
+            print(
+                f"[orchestrator] pipeline complete ({out_dir})",
+                file=sys.__stdout__,
+                flush=True,
+            )
         write_json(orch_dir / "orchestrator.json", summary, indent=2)
     finally:
         if run_lock is not None:

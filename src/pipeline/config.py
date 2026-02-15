@@ -207,6 +207,30 @@ def normalize_input(
                 return str(v)
         return None
 
+    def _normalize_dockq_bin(value: str | None) -> str | None:
+        """
+        Resolve DockQ executable/script robustly.
+
+        Accepts:
+        - absolute/relative filesystem paths (must exist)
+        - command names on PATH (e.g. "DockQ", "dockq")
+        """
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        # Command-style value (no path separators): resolve via PATH.
+        if ("/" not in text) and ("\\" not in text):
+            exe = shutil.which(text)
+            if exe:
+                return str(Path(exe).resolve())
+            return None
+        p = Path(text)
+        if p.exists():
+            return str(p.resolve())
+        return None
+
     if not tools.get("mpnn_repo"):
         candidate = _env_fallback_path("PROTEINMPNN_REPO", "PPIFLOW_MPNN_REPO")
         if candidate:
@@ -247,27 +271,29 @@ def normalize_input(
             local = _ROOT / "assets" / "weights" / "af3"
             if local.exists():
                 tools["af3_weights"] = str(local)
-    if not tools.get("dockq_bin"):
+    dockq_bin = _normalize_dockq_bin(tools.get("dockq_bin"))
+    if not dockq_bin:
         candidate = _env_fallback_path("DOCKQ_BIN", "PPIFLOW_DOCKQ_BIN")
-        if candidate:
-            tools["dockq_bin"] = resolve_optional_path(candidate, base_dir=base_dir)
-        else:
-            # Support both legacy and current DockQ repository layouts.
-            local_candidates = [
-                _ROOT / "assets" / "external" / "DockQ" / "DockQ.py",
-                _ROOT / "assets" / "external" / "DockQ" / "src" / "DockQ" / "DockQ.py",
-            ]
-            for local in local_candidates:
-                if local.exists():
-                    tools["dockq_bin"] = str(local)
-                    break
-            if not tools.get("dockq_bin"):
-                # Final fallback: use PATH entrypoints from pip/conda installs.
-                for exe_name in ("DockQ", "dockq"):
-                    exe = shutil.which(exe_name)
-                    if exe:
-                        tools["dockq_bin"] = str(Path(exe))
-                        break
+        dockq_bin = _normalize_dockq_bin(candidate)
+    if not dockq_bin:
+        # Support both legacy and current DockQ repository layouts.
+        local_candidates = [
+            _ROOT / "assets" / "external" / "DockQ" / "DockQ.py",
+            _ROOT / "assets" / "external" / "DockQ" / "src" / "DockQ" / "DockQ.py",
+        ]
+        for local in local_candidates:
+            if local.exists():
+                dockq_bin = str(local.resolve())
+                break
+    if not dockq_bin:
+        # Final fallback: use PATH entrypoints from pip/conda installs.
+        for exe_name in ("DockQ", "dockq"):
+            exe = shutil.which(exe_name)
+            if exe:
+                dockq_bin = str(Path(exe).resolve())
+                break
+    if dockq_bin:
+        tools["dockq_bin"] = dockq_bin
 
     if not tools.get("rosetta_bin"):
         candidate = _ROOT / "assets" / "tools" / "rosetta_scripts"
