@@ -269,11 +269,20 @@ class SeqDesignStep(ExternalCommandStep):
         if not raw:
             return None
         path = Path(str(raw))
-        if path.is_dir():
-            return path / "protein_mpnn_run.py"
-        # Accept --mpnn_run as either an explicit script path or a directory-like value.
-        if path.name == "protein_mpnn_run.py":
+        # Accept explicit runner scripts for both ProteinMPNN and AntiBMPNN.
+        if path.is_file():
             return path
+        if path.suffix == ".py":
+            return path
+        if path.is_dir():
+            protein_mpnn = path / "protein_mpnn_run.py"
+            if protein_mpnn.exists():
+                return protein_mpnn
+            anti_mpnn = path / "Running_AntiBMPNN_run.py"
+            if anti_mpnn.exists():
+                return anti_mpnn
+            return protein_mpnn
+        # Directory-like fallback for legacy values.
         return path / "protein_mpnn_run.py"
 
     def _require_mpnn_run(self, ctx: StepContext) -> Path:
@@ -285,7 +294,9 @@ class SeqDesignStep(ExternalCommandStep):
         cfg_path = self.cfg.get("config_path")
         msg = (
             f"MPNN runner not found at {resolved}. "
-            f"Set tools.{run_key} to protein_mpnn_run.py or tools.{repo_key} to a ProteinMPNN repo."
+            f"Set tools.{run_key} to a valid runner script "
+            "(for example protein_mpnn_run.py or Running_AntiBMPNN_run.py), "
+            f"or set tools.{repo_key} to a repo containing one."
         )
         if cfg_path:
             msg += f" (config: {cfg_path})"
@@ -896,6 +907,11 @@ class SeqDesignStep(ExternalCommandStep):
                 cand = base / f"{stem}{suffix}"
                 if cand.exists():
                     return cand
+            # AntiBMPNN names files like "<stem>|abmpnn|N-...|T-....fa".
+            for suffix in [".fa", ".fasta", ".fa.gz", ".fasta.gz"]:
+                matches = sorted(base.glob(f"{stem}|*{suffix}"))
+                if matches:
+                    return matches[0]
         return None
 
     def build_items(self, ctx: StepContext) -> list[WorkItem]:
@@ -1729,6 +1745,11 @@ class FlowPackerStep(ExternalCommandStep):
             cand = seq_dir / f"{stem}{suffix}"
             if cand.exists():
                 return cand
+        # AntiBMPNN names files like "<stem>|abmpnn|N-...|T-....fa".
+        for suffix in [".fa", ".fasta", ".fa.gz", ".fasta.gz"]:
+            matches = sorted(seq_dir.glob(f"{stem}|*{suffix}"))
+            if matches:
+                return matches[0]
         return None
 
     def _write_seq_csv(self, fasta_path: Path, csv_path: Path, link_name: str) -> int:
@@ -1814,6 +1835,7 @@ class FlowPackerStep(ExternalCommandStep):
         run_stems = compute_run_stems(pdbs, input_pdb_dir)
 
         items: list[WorkItem] = []
+        missing_fasta: list[str] = []
         for pdb_path in pdbs:
             run_stem = run_stems[pdb_path]
             fasta_path = self._find_fasta(seq_fasta_dir, run_stem) if seq_fasta_dir else None
@@ -1822,6 +1844,9 @@ class FlowPackerStep(ExternalCommandStep):
                 # If run_stem != pdb_path.stem, using the fallback can silently attach
                 # an ambiguous FASTA to multiple distinct PDBs.
                 fasta_path = self._find_fasta(seq_fasta_dir, pdb_path.stem) if seq_fasta_dir else None
+            if fasta_path is None:
+                missing_fasta.append(run_stem)
+                continue
             items.append(
                 WorkItem(
                     id=run_stem,
@@ -1832,6 +1857,12 @@ class FlowPackerStep(ExternalCommandStep):
                         "fasta_path": str(fasta_path) if fasta_path else None,
                     },
                 )
+            )
+        if not items:
+            sample = ", ".join(missing_fasta[:3]) if missing_fasta else "n/a"
+            raise StepError(
+                f"No FlowPacker items have matching FASTA inputs in {seq_fasta_dir}. "
+                f"Missing FASTA for {len(missing_fasta)} PDB(s); sample: {sample}"
             )
         return items
 

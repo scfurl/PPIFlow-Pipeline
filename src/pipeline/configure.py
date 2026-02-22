@@ -483,10 +483,6 @@ def configure_pipeline(args) -> dict:
     if spec.source_path is None:
         write_cli_input_yaml(data, out_dir)
 
-    # write pipeline_input.json (resume identity)
-    input_json_path = out_dir / "pipeline_input.json"
-    write_json(input_json_path, normalized, indent=2)
-
     tool_versions = collect_tool_versions(normalized.get("tools") or {})
     sampling = normalized.get("sampling") or {}
     target_n = int(sampling.get("samples_per_target", 0) or 0)
@@ -497,6 +493,11 @@ def configure_pipeline(args) -> dict:
         target_n=target_n,
         seeds=(sampling.get("seeds") or None),
     )
+
+    # Write resume identity only after state validation succeeds. Otherwise a failed
+    # reconfigure can leave pipeline_input.json out-of-sync with pipeline_state.json.
+    input_json_path = out_dir / "pipeline_input.json"
+    write_json(input_json_path, normalized, indent=2)
 
     # write per-step configs
     config_dir = out_dir / "config"

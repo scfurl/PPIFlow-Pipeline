@@ -181,6 +181,41 @@ def _outputs_complete(
         return False
 
 
+def _cap_rosetta_pool_by_item_count(
+    *,
+    step_name: str,
+    step_cfg: dict[str, Any],
+    ctx: StepContext,
+    requested_pool_size: int,
+) -> int:
+    """
+    Avoid spawning more Rosetta item workers than available items.
+
+    This prevents avoidable SQLite write contention (many idle workers racing on queue DB).
+    """
+    if requested_pool_size <= 1 or not _is_rosetta_items_step(step_name):
+        return max(1, int(requested_pool_size))
+    step_cls = STEP_REGISTRY.get(step_name)
+    if not step_cls:
+        return max(1, int(requested_pool_size))
+    try:
+        step = step_cls(step_cfg)
+        items = step.list_items(ctx, readonly=True)
+        item_count = len(items)
+    except Exception:
+        # If we cannot determine count, keep requested pool size and let step handle errors.
+        return max(1, int(requested_pool_size))
+    if item_count > 0 and int(requested_pool_size) > int(item_count):
+        capped = int(item_count)
+        print(
+            f"[orchestrator] {step_name}: capping pool_size {requested_pool_size} -> {capped} (items={item_count})",
+            file=sys.__stdout__,
+            flush=True,
+        )
+        return max(1, capped)
+    return max(1, int(requested_pool_size))
+
+
 def _normalize_failure_policy(raw: Dict[str, Any], override_mode: Optional[str]) -> FailurePolicy:
     # Default should match CLI semantics: fail on item errors unless the user explicitly opts in
     # to tolerant execution (--continue-on-error / failure-policy allow/threshold).
@@ -1108,7 +1143,15 @@ def orchestrate_pipeline(args) -> None:
 
                 entry_step = entry.steps[0] if entry.steps else entry.name
                 rosetta_pool = _is_rosetta_items_step(entry_step)
-                direct_logs = int(entry.pool_size) >= int(DIRECT_LOG_POOL_SIZE_THRESHOLD)
+                runtime_pool_size = int(entry.pool_size)
+                if rosetta_pool:
+                    runtime_pool_size = _cap_rosetta_pool_by_item_count(
+                        step_name=entry_step,
+                        step_cfg=step_cfgs.get(entry_step) or {"name": entry_step},
+                        ctx=ready_ctx,
+                        requested_pool_size=runtime_pool_size,
+                    )
+                direct_logs = int(runtime_pool_size) >= int(DIRECT_LOG_POOL_SIZE_THRESHOLD)
                 rosetta_env = None
                 if rosetta_pool:
                     rosetta_env = {
@@ -1123,7 +1166,7 @@ def orchestrate_pipeline(args) -> None:
                 procs, workers = _spawn_workers(
                     out_dir=out_dir,
                     steps=entry.steps,
-                    pool_size=entry.pool_size,
+                    pool_size=runtime_pool_size,
                     identity_env=identity_env,
                     cuda_bind=(cuda_bind and not rosetta_pool),
                     clear_cuda_visible_devices=(rosetta_pool and identity_env),
@@ -1220,7 +1263,7 @@ def orchestrate_pipeline(args) -> None:
                     "entry": {
                         "name": entry.name,
                         "steps": entry.steps,
-                        "pool_size": entry.pool_size,
+                        "pool_size": runtime_pool_size,
                     },
                     "attempt": attempt,
                     "started_at": start_ts,

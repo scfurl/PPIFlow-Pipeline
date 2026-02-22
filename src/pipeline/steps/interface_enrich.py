@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import re
 from pathlib import Path
@@ -35,6 +36,13 @@ _ONE_TO_THREE = {
     "Y": "TYR",
     "V": "VAL",
 }
+
+
+def _has_module(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
 
 
 def _format_res_id(res: PDB.Residue.Residue) -> str:
@@ -213,9 +221,20 @@ def _extract_fw_cdr_positions(pdb_path: Path, chain_id: str) -> tuple[str, str]:
     if len(full_seq) < 50:
         raise StepError(f"Chain {chain_id} sequence too short for CDR extraction in {pdb_path}")
 
+    anarci_available = _has_module("anarci")
+    anarcii_available = _has_module("anarcii")
+    chain_kwargs: dict[str, Any] = {}
+    if not anarci_available and anarcii_available:
+        # Prefer ANARCII when legacy ANARCI is unavailable in the environment.
+        chain_kwargs["use_anarcii"] = True
+
     try:
-        ab_chain = Chain(full_seq, scheme="imgt", cdr_definition="imgt")
+        ab_chain = Chain(full_seq, scheme="imgt", cdr_definition="imgt", **chain_kwargs)
     except (ChainParseError, Exception) as exc:
+        if not anarci_available and not anarcii_available:
+            raise StepError(
+                "Failed to parse antibody chain: neither 'anarci' nor 'anarcii' is installed"
+            ) from exc
         raise StepError(f"Failed to parse antibody chain for {pdb_path}") from exc
 
     v_seq_str = ab_chain.seq

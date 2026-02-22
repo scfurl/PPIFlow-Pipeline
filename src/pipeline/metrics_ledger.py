@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,10 @@ def _iso(ts: Optional[float] = None) -> str:
     if ts is None:
         ts = time.time()
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _warn(message: str) -> None:
+    print(f"[metrics_ledger] WARN {message}", file=sys.__stdout__, flush=True)
 
 
 def _jsonable(value: Any) -> Any:
@@ -78,8 +83,14 @@ class MetricsLedger:
         self.run_dir = Path(run_dir)
         self.step_output_dir = Path(step_output_dir)
         self.db_path = self.step_output_dir / "metrics.db"
-        self.sqlite_journal_mode = str(sqlite_journal_mode or "WAL").upper()
-        self.busy_timeout_ms = int(busy_timeout_ms)
+        journal_env = os.environ.get("PPIFLOW_METRICS_SQLITE_JOURNAL_MODE") or os.environ.get(
+            "PPIFLOW_SQLITE_JOURNAL_MODE"
+        )
+        self.sqlite_journal_mode = str(journal_env or sqlite_journal_mode or "WAL").upper()
+        busy_timeout_env = os.environ.get("PPIFLOW_METRICS_BUSY_TIMEOUT_MS") or os.environ.get(
+            "PPIFLOW_SQLITE_BUSY_TIMEOUT_MS"
+        )
+        self.busy_timeout_ms = int(busy_timeout_env or busy_timeout_ms)
         self._conn: sqlite3.Connection | None = None
         # Snapshot expected lock id if provided; otherwise resolve lazily on first write.
         self._expected_run_lock_id: str | None = os.environ.get("PPIFLOW_RUN_LOCK_ID")
@@ -106,7 +117,25 @@ class MetricsLedger:
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(f"PRAGMA journal_mode = {self.sqlite_journal_mode}")
+        conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+        deadline = time.time() + max(5.0, float(self.busy_timeout_ms) / 1000.0 * 2.0)
+        while True:
+            try:
+                conn.execute(f"PRAGMA journal_mode = {self.sqlite_journal_mode}")
+                break
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if self.sqlite_journal_mode == "WAL" and "locking protocol" in msg:
+                    self.sqlite_journal_mode = "DELETE"
+                    _warn("WAL unavailable (locking protocol); falling back to DELETE")
+                    continue
+                if ("locked" in msg or "busy" in msg) and time.time() < deadline:
+                    time.sleep(0.1)
+                    continue
+                if "locked" in msg or "busy" in msg:
+                    _warn(f"metrics ledger: could not set journal_mode={self.sqlite_journal_mode}; continuing")
+                    break
+                raise
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         return conn

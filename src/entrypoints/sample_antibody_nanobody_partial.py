@@ -362,11 +362,14 @@ def preprocess_csv_and_pkl(args, output_dir) -> str:
     }
 
     sample_ids = _resolve_sample_ids(args.sample_ids, args.samples_per_target)
-    for idx, id in enumerate(sample_ids):
+    rows = []
+    for id in sample_ids:
         metadata = process_file(input_info, write_dir=output_dir, id=id)
-        metadata_df = pd.DataFrame([metadata])
-        header = False if idx > 0 else True
-        metadata_df.to_csv(csv_path, index=False, mode="a", header=header)
+        rows.append(metadata)
+
+    # Always rewrite the per-run input CSV to avoid duplicated headers/rows on retries.
+    metadata_df = pd.DataFrame(rows)
+    metadata_df.to_csv(csv_path, index=False)
 
     return csv_path
 

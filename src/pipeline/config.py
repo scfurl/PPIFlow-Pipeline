@@ -160,35 +160,47 @@ def normalize_input(
     out["target_concat_enabled"] = True
     if output_dir is None:
         raise ConfigError("normalize_input requires output_dir for target concatenation")
-    try:
-        concat_info = concatenate_target_chains(
-            out["target"]["pdb"],
-            out["target"]["chains"],
-            output_dir,
-            gap_residues=int(out.get("target_concat_gap") or 50),
-        )
-    except Exception as exc:
-        raise ConfigError(f"Failed to concatenate target chains: {exc}") from exc
-    out["target"]["original_pdb"] = out["target"]["pdb"]
-    out["target"]["pdb"] = concat_info["concatenated_pdb"]
-    out["target"]["chains"] = ["B"]
-    out["target"]["chain_map"] = concat_info["chain_map_path"]
-    out["target"]["chain_offsets"] = concat_info["offsets_path"]
-
-    if "hotspots" in out["target"]:
+    already_concatenated = (
+        out["target"].get("original_pdb")
+        and out["target"].get("chain_map")
+        and out["target"].get("chain_offsets")
+        and out["target"].get("chains") == ["B"]
+    )
+    if already_concatenated:
+        # Idempotent resume path: preserve existing concatenated target metadata
+        # from pipeline_input.json instead of concatenating again.
+        out["target"]["original_pdb"] = resolve_optional_path(out["target"].get("original_pdb"), base_dir=base_dir)
+        out["target"]["chain_map"] = resolve_optional_path(out["target"].get("chain_map"), base_dir=base_dir)
+        out["target"]["chain_offsets"] = resolve_optional_path(out["target"].get("chain_offsets"), base_dir=base_dir)
+    else:
         try:
-            expanded = expand_hotspots(
-                out["target"].get("hotspots"),
-                pdb_path=out["target"]["original_pdb"],
+            concat_info = concatenate_target_chains(
+                out["target"]["pdb"],
+                out["target"]["chains"],
+                output_dir,
+                gap_residues=int(out.get("target_concat_gap") or 50),
             )
-            mapped = map_hotspots_to_concatenated(expanded, concat_info["chain_map_entries"])
-            compressed = compress_hotspots(mapped)
-            mapped_value, mapped_file = maybe_write_hotspots_file(compressed, output_dir)
-            out["target"]["hotspots"] = mapped_value
-            if mapped_file:
-                out["target"]["hotspots_file"] = mapped_file
         except Exception as exc:
-            raise ConfigError(f"Failed to expand hotspots: {exc}") from exc
+            raise ConfigError(f"Failed to concatenate target chains: {exc}") from exc
+        out["target"]["original_pdb"] = out["target"]["pdb"]
+        out["target"]["pdb"] = concat_info["concatenated_pdb"]
+        out["target"]["chains"] = ["B"]
+        out["target"]["chain_map"] = concat_info["chain_map_path"]
+        out["target"]["chain_offsets"] = concat_info["offsets_path"]
+        if "hotspots" in out["target"]:
+            try:
+                expanded = expand_hotspots(
+                    out["target"].get("hotspots"),
+                    pdb_path=out["target"]["original_pdb"],
+                )
+                mapped = map_hotspots_to_concatenated(expanded, concat_info["chain_map_entries"])
+                compressed = compress_hotspots(mapped)
+                mapped_value, mapped_file = maybe_write_hotspots_file(compressed, output_dir)
+                out["target"]["hotspots"] = mapped_value
+                if mapped_file:
+                    out["target"]["hotspots_file"] = mapped_file
+            except Exception as exc:
+                raise ConfigError(f"Failed to expand hotspots: {exc}") from exc
     if out.get("framework"):
         out["framework"]["pdb"] = resolve_path(out["framework"]["pdb"], base_dir=base_dir)
     tools = out.get("tools") or {}

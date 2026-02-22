@@ -111,8 +111,14 @@ class WorkQueue:
                 self.wait_timeout = float(self.wait_timeout)
             except Exception:
                 self.wait_timeout = None
-        self.sqlite_journal_mode = str(self.cfg.get("sqlite_journal_mode") or "WAL").upper()
-        self.busy_timeout_ms = int(self.cfg.get("busy_timeout_ms") or 5000)
+        journal_env = os.environ.get("PPIFLOW_WORK_QUEUE_SQLITE_JOURNAL_MODE") or os.environ.get(
+            "PPIFLOW_SQLITE_JOURNAL_MODE"
+        )
+        self.sqlite_journal_mode = str(journal_env or self.cfg.get("sqlite_journal_mode") or "WAL").upper()
+        busy_timeout_env = os.environ.get("PPIFLOW_WORK_QUEUE_BUSY_TIMEOUT_MS") or os.environ.get(
+            "PPIFLOW_SQLITE_BUSY_TIMEOUT_MS"
+        )
+        self.busy_timeout_ms = int(busy_timeout_env or self.cfg.get("busy_timeout_ms") or 5000)
 
         self.worker_id = worker_id or self._default_worker_id()
         # Snapshot expected lock id if provided; otherwise resolve lazily on first DB mutation.
@@ -159,7 +165,26 @@ class WorkQueue:
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(f"PRAGMA journal_mode = {self.sqlite_journal_mode}")
+        conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+        deadline = time.time() + max(5.0, float(self.busy_timeout_ms) / 1000.0 * 2.0)
+        while True:
+            try:
+                conn.execute(f"PRAGMA journal_mode = {self.sqlite_journal_mode}")
+                break
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if self.sqlite_journal_mode == "WAL" and "locking protocol" in msg:
+                    # WAL can fail on shared filesystems; transparently downgrade to DELETE.
+                    self.sqlite_journal_mode = "DELETE"
+                    _warn(f"{self.step}: WAL unavailable (locking protocol); falling back to DELETE")
+                    continue
+                if ("locked" in msg or "busy" in msg) and time.time() < deadline:
+                    time.sleep(0.1)
+                    continue
+                if "locked" in msg or "busy" in msg:
+                    _warn(f"{self.step}: could not set journal_mode={self.sqlite_journal_mode}; continuing")
+                    break
+                raise
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         return conn
@@ -1082,17 +1107,43 @@ def wait_for_step(
     step_dir = Path(step_dir)
     start = time.time()
     while True:
-        if (step_dir / "queue.db").exists():
-            wq = WorkQueue.from_step_dir(step_dir)
-            counts = wq.counts()
-            total = sum(counts.values())
-            leader = wq.leader_status() if total == 0 else None
-            if leader:
-                status = str(leader.get("status") or "")
-                if status == "failed":
-                    return WaitResult(status="failed", reason=None, failed=True)
-                if status == "completed":
-                    progress = wq.progress()
+        try:
+            if (step_dir / "queue.db").exists():
+                wq = WorkQueue.from_step_dir(step_dir)
+                counts = wq.counts()
+                total = sum(counts.values())
+                leader = wq.leader_status() if total == 0 else None
+                if leader:
+                    status = str(leader.get("status") or "")
+                    if status == "failed":
+                        return WaitResult(status="failed", reason=None, failed=True)
+                    if status == "completed":
+                        progress = wq.progress()
+                        return WaitResult(
+                            status="completed",
+                            reason=None,
+                            counts=counts,
+                            progress=progress,
+                            complete=True,
+                        )
+                    if status == "running":
+                        # Leader is still active; do not short-circuit on counts.
+                        progress = wq.progress()
+                        if progress:
+                            progress["status"] = "running"
+                        if timeout is not None and (time.time() - start) >= float(timeout):
+                            return WaitResult(status="timeout", reason="timeout")
+                        time.sleep(max(float(poll_seconds), 0.5))
+                        continue
+                progress = wq.progress()
+                counts = progress.get("counts") if progress else None
+                if counts and sum(counts.values()) == 0 and leader is None:
+                    # No items and no leader row yet; treat as running until a leader appears.
+                    if timeout is not None and (time.time() - start) >= float(timeout):
+                        return WaitResult(status="timeout", reason="timeout")
+                    time.sleep(max(float(poll_seconds), 0.5))
+                    continue
+                if progress and str(progress.get("status") or "") == "completed":
                     return WaitResult(
                         status="completed",
                         reason=None,
@@ -1100,31 +1151,14 @@ def wait_for_step(
                         progress=progress,
                         complete=True,
                     )
-                if status == "running":
-                    # Leader is still active; do not short-circuit on counts.
-                    progress = wq.progress()
-                    if progress:
-                        progress["status"] = "running"
-                    if timeout is not None and (time.time() - start) >= float(timeout):
-                        return WaitResult(status="timeout", reason="timeout")
-                    time.sleep(max(float(poll_seconds), 0.5))
-                    continue
-            progress = wq.progress()
-            counts = progress.get("counts") if progress else None
-            if counts and sum(counts.values()) == 0 and leader is None:
-                # No items and no leader row yet; treat as running until a leader appears.
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "locked" in msg or "busy" in msg:
                 if timeout is not None and (time.time() - start) >= float(timeout):
                     return WaitResult(status="timeout", reason="timeout")
                 time.sleep(max(float(poll_seconds), 0.5))
                 continue
-            if progress and str(progress.get("status") or "") == "completed":
-                return WaitResult(
-                    status="completed",
-                    reason=None,
-                    counts=counts,
-                    progress=progress,
-                    complete=True,
-                )
+            raise
         if timeout is not None and (time.time() - start) >= float(timeout):
             return WaitResult(status="timeout", reason="timeout")
         time.sleep(max(float(poll_seconds), 0.5))

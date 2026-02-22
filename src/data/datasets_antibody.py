@@ -248,7 +248,8 @@ class AntibodyTestDataset(Dataset):
         chain_idx = feats["chain_idx"]
         chain_group_idx = feats["chain_group_idx"]
         aatype = aatype * (1 - cdr_mask) + 20 * cdr_mask
-        pos_fixed_mask = cdr_mask + framework_mask  # 0: fixed, 1: no fixed
+        # Keep mask binary; overlapping masks can otherwise produce value 2.
+        pos_fixed_mask = torch.clamp(cdr_mask + framework_mask, min=0, max=1)  # 0: fixed, 1: no fixed
         diffuse_mask = pos_fixed_mask
 
         output_feats = {
@@ -499,7 +500,8 @@ class AntibodyPartialDataset(Dataset):
         chain_idx = feats["chain_idx"]
         chain_group_idx = feats["chain_group_idx"]
         fix_structure_mask = feats["fix_structure_mask"]
-        fix_sequence_mask = feats["fix_structure_mask"] + framework_mask
+        # Keep mask binary; overlap with framework can produce value 2 and invalid aatype math.
+        fix_sequence_mask = torch.clamp(fix_structure_mask + framework_mask, min=0, max=1)
         # print("="*30)
         # print(f"fix_structure_mask: {fix_structure_mask}")
         # print(f"fix_sequence_mask: {fix_sequence_mask}")

@@ -12,3 +12,8 @@ docs/
 
 tests/
 pytest.ini
+pdbs/
+test_runs/
+production_runs/
+
+.cache

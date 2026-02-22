@@ -136,6 +136,14 @@ def _run_job(
         return name, False, time.time() - start, str(exc), out_path
 
 
+def _has_relax_output(job_dir: Path) -> bool:
+    # rosetta_scripts writes *_0001.pdb by default for a successful relax.
+    for pdb in job_dir.glob("*.pdb*"):
+        if pdb.name.endswith("_0001.pdb") or pdb.name.endswith("_0001.pdb.gz"):
+            return True
+    return False
+
+
 class RosettaInterfaceStep(Step):
     name = "rosetta_interface"
     stage = "rosetta"
@@ -800,7 +808,8 @@ class RosettaRelaxStep(Step):
         xml_path = job_dir / "update.xml"
         _write_update_xml(template_text, job_pdb, xml_path)
         log_path = out_dir_job / f"{name}.out"
-        if not log_path.exists():
+        need_run = (not log_path.exists()) or (not _has_relax_output(job_dir))
+        if need_run:
             cmd = _resolve_rosetta_cmd(str(rosetta_bin)) + [
                 "-parser:protocol",
                 str(xml_path),
@@ -832,6 +841,14 @@ class RosettaRelaxStep(Step):
             raise StepError(f"Relax output missing for {name}")
         target = out_dir / f"{name}.pdb"
         allow_reuse = bool((ctx.work_queue or {}).get("allow_reuse", True))
+        if allow_reuse and target.exists():
+            # Retry runs can regenerate a valid but non-byte-identical relaxed PDB.
+            # If the final target is already present, prefer reusing it instead of
+            # failing on a promote collision.
+            shutil.rmtree(item_dir, ignore_errors=True)
+            if output_enabled:
+                shutil.rmtree(job_root.parent, ignore_errors=True)
+            return
         promote_file_atomic(relaxed, target, allow_reuse=allow_reuse)
         if output_enabled and not is_minimal(ctx):
             promote_tree(job_root, optional_dir(ctx) / "relax" / "rosetta_jobs", allow_reuse=allow_reuse)
@@ -885,7 +902,7 @@ class RosettaRelaxStep(Step):
             xml_path = job_dir / "update.xml"
             _write_update_xml(template_text, job_pdb, xml_path)
             log_path = out_dir_job / f"{name}.out"
-            if log_path.exists():
+            if log_path.exists() and _has_relax_output(job_dir):
                 continue
             cmd = _resolve_rosetta_cmd(str(rosetta_bin)) + [
                 "-parser:protocol",
